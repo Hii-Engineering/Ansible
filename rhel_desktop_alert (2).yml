@@ -1,0 +1,261 @@
+---
+- name: Required emergency alert on RHEL desktops
+  hosts: desktop_alert_targets
+  gather_facts: false
+  become: true
+
+  # ======================== REPLACE THESE VALUES ========================
+  vars:
+    ansible_user: "solarc"
+    ansible_password: "000000000"
+    ansible_become_password: "{{ ansible_password }}"  # Change if sudo differs
+
+    alert_title: "HIGH TEMPERATURE DETECTED"
+    alert_message: >-
+      A high temperature reading has been detected. The entire system will
+      begin shutting down when the timer reaches zero unless the shutdown is aborted.
+    response_url: "https://REPLACE-WITH-YOUR-WEB-PAGE.example"
+    shutdown_countdown_seconds: 600
+  # =====================================================================
+
+  tasks:
+    - name: Confirm Python GTK is available
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - "import gi; gi.require_version('Gdk', '3.0'); gi.require_version('Gtk', '3.0'); from gi.repository import Gdk, Gtk"
+      changed_when: false
+
+    - name: Find the active local graphical session
+      ansible.builtin.shell: |
+        for session in $(loginctl list-sessions --no-legend | awk '{print $1}'); do
+          active=$(loginctl show-session "$session" -p Active --value)
+          remote=$(loginctl show-session "$session" -p Remote --value)
+          type=$(loginctl show-session "$session" -p Type --value)
+          class=$(loginctl show-session "$session" -p Class --value)
+          if [[ "$active" == "yes" && "$remote" == "no" && "$class" == "user" && ( "$type" == "x11" || "$type" == "wayland" ) ]]; then
+            user=$(loginctl show-session "$session" -p Name --value)
+            uid=$(loginctl show-session "$session" -p User --value)
+            display=$(loginctl show-session "$session" -p Display --value)
+            printf '%s|%s|%s\n' "$user" "$uid" "$display"
+            exit 0
+          fi
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      register: gui_session
+      changed_when: false
+      failed_when: gui_session.rc != 0 or gui_session.stdout | trim == ""
+
+    - name: Save graphical-session values
+      ansible.builtin.set_fact:
+        gui_user: "{{ (gui_session.stdout | trim).split('|')[0] }}"
+        gui_uid: "{{ (gui_session.stdout | trim).split('|')[1] }}"
+        gui_display: "{{ (gui_session.stdout | trim).split('|')[2] | default('') }}"
+
+    - name: Create the styled acknowledgment application
+      ansible.builtin.copy:
+        dest: /tmp/rhel-required-alert.py
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          import fcntl
+          import os
+          import subprocess
+          import sys
+          import time
+
+          import gi
+          gi.require_version("Gdk", "3.0")
+          gi.require_version("Gtk", "3.0")
+          from gi.repository import Gdk, Gio, GLib, Gtk
+
+          title = os.environ.get("ALERT_TITLE", "CRITICAL SYSTEM ALERT")
+          message = os.environ.get("ALERT_MESSAGE", "Immediate attention is required.")
+          url = os.environ.get("RESPONSE_URL", "https://example.invalid")
+          countdown_seconds = int(os.environ.get("COUNTDOWN_SECONDS", "600"))
+          shutdown_deadline = time.monotonic() + countdown_seconds
+
+          lock = open("/tmp/rhel-required-alert-{}.lock".format(os.getuid()), "w")
+          try:
+              fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          except BlockingIOError:
+              sys.exit(0)
+
+          css = b"""
+          window { background-color: #0d1422; }
+          .alert-card { background-color: #172033; border: 3px solid #172033;
+                        border-radius: 16px; padding: 30px; }
+          .alert-card-pulse { background-color: #172033; border-color: #ff263b; }
+          .warning-icon { color: #ff4d5a; font-size: 72px; }
+          .alert-title { color: #ffffff; font-size: 28px; font-weight: bold; }
+          .alert-message { color: #e7edf7; font-size: 18px; }
+          .countdown-caption { color: #ffb4ba; font-size: 15px; font-weight: bold; }
+          .countdown { color: #ff3547; font-size: 46px; font-weight: bold; }
+          .alert-link { color: #8fc7ff; font-size: 16px; }
+          .alert-note { color: #aeb9cc; font-size: 13px; }
+          .open-button { background-image: none; background-color: #33415c;
+                         color: #ffffff; border-radius: 8px; padding: 12px 24px; }
+          .ack-button { background-image: none; background-color: #d7192d;
+                        color: #ffffff; border-radius: 8px; padding: 12px 28px;
+                        font-weight: bold; }
+          """
+          provider = Gtk.CssProvider()
+          provider.load_from_data(css)
+          Gtk.StyleContext.add_provider_for_screen(
+              Gdk.Screen.get_default(), provider,
+              Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+          window = Gtk.Window(title=title)
+          window.set_default_size(780, 560)
+          window.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+          window.set_keep_above(True)
+          window.set_resizable(False)
+          window.connect("delete-event", lambda *_: True)
+
+          outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+          outer.set_border_width(24)
+          window.add(outer)
+
+          card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+          card.get_style_context().add_class("alert-card")
+          outer.pack_start(card, True, True, 0)
+
+          icon = Gtk.Label(label="⚠")
+          icon.get_style_context().add_class("warning-icon")
+          card.pack_start(icon, False, False, 0)
+
+          heading = Gtk.Label(label=title)
+          heading.get_style_context().add_class("alert-title")
+          heading.set_justify(Gtk.Justification.CENTER)
+          card.pack_start(heading, False, False, 0)
+
+          body = Gtk.Label(label=message)
+          body.get_style_context().add_class("alert-message")
+          body.set_justify(Gtk.Justification.CENTER)
+          body.set_line_wrap(True)
+          body.set_max_width_chars(68)
+          card.pack_start(body, False, False, 0)
+
+          countdown_caption = Gtk.Label(label="AUTOMATIC SHUTDOWN BEGINS IN")
+          countdown_caption.get_style_context().add_class("countdown-caption")
+          card.pack_start(countdown_caption, False, False, 0)
+
+          countdown = Gtk.Label(label="10:00")
+          countdown.get_style_context().add_class("countdown")
+          card.pack_start(countdown, False, False, 0)
+
+          portal = Gtk.Label(label="Incident response portal")
+          portal.get_style_context().add_class("alert-link")
+          portal.set_justify(Gtk.Justification.CENTER)
+          card.pack_start(portal, False, False, 0)
+
+          note = Gtk.Label(label="Acknowledging this warning does NOT abort the shutdown.")
+          note.get_style_context().add_class("alert-note")
+          card.pack_start(note, False, False, 0)
+
+          buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+          buttons.set_halign(Gtk.Align.CENTER)
+          card.pack_end(buttons, False, False, 0)
+
+          open_button = Gtk.Button(label="OPEN ABORT PAGE")
+          open_button.get_style_context().add_class("open-button")
+          open_button.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(url, None))
+          buttons.pack_start(open_button, False, False, 0)
+
+          def acknowledge(*_args):
+              subprocess.call(["logger", "-t", "rhel-required-alert",
+                               "Acknowledged by {}: {}".format(os.environ.get("USER", "unknown"), title)])
+              Gtk.main_quit()
+
+          ack_button = Gtk.Button(label="ACKNOWLEDGE")
+          ack_button.get_style_context().add_class("ack-button")
+          ack_button.connect("clicked", acknowledge)
+          buttons.pack_start(ack_button, False, False, 0)
+
+          blink_state = {"visible": True}
+          def blink_icon():
+              blink_state["visible"] = not blink_state["visible"]
+              icon.set_opacity(1.0 if blink_state["visible"] else 0.18)
+              if blink_state["visible"]:
+                  card.get_style_context().remove_class("alert-card-pulse")
+              else:
+                  card.get_style_context().add_class("alert-card-pulse")
+              return True
+
+          def update_countdown():
+              remaining = max(0, int(shutdown_deadline - time.monotonic() + 0.999))
+              minutes, seconds = divmod(remaining, 60)
+              countdown.set_text("{:02d}:{:02d}".format(minutes, seconds))
+              if remaining == 0:
+                  countdown_caption.set_text("SHUTDOWN SEQUENCE IS STARTING")
+                  countdown.set_text("00:00")
+              return True
+
+          GLib.timeout_add(650, blink_icon)
+          GLib.timeout_add(250, update_countdown)
+          update_countdown()
+          window.show_all()
+          window.present()
+          Gtk.main()
+
+    - name: Stop any previous alert instance
+      become_user: "{{ gui_user }}"
+      ansible.builtin.shell: |
+        ps -u {{ gui_uid | quote }} -o pid= -o args= | awk '
+          $2 == "python3" && $3 == "/tmp/rhel-required-alert.py" {print $1}
+          $2 == "bash" && $3 == "/tmp/rhel-required-alert.sh" {print $1}
+        ' | while read -r pid; do
+          kill "$pid" 2>/dev/null || true
+        done
+        rm -f /tmp/rhel-required-alert-{{ gui_uid }}.pid
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Launch alert in the active desktop session
+      become_user: "{{ gui_user }}"
+      ansible.builtin.shell: |
+        : > /tmp/rhel-required-alert-{{ gui_uid }}.log
+        WAYLAND_VALUE=""
+        if [[ -S /run/user/{{ gui_uid }}/wayland-0 ]]; then
+          WAYLAND_VALUE="wayland-0"
+        fi
+        nohup env \
+          XDG_RUNTIME_DIR=/run/user/{{ gui_uid }} \
+          DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ gui_uid }}/bus \
+          DISPLAY={{ (gui_display if gui_display | length > 0 else ':0') | quote }} \
+          WAYLAND_DISPLAY="$WAYLAND_VALUE" \
+          ALERT_TITLE={{ alert_title | quote }} \
+          ALERT_MESSAGE={{ alert_message | quote }} \
+          RESPONSE_URL={{ response_url | quote }} \
+          COUNTDOWN_SECONDS={{ shutdown_countdown_seconds | int }} \
+          python3 /tmp/rhel-required-alert.py \
+          >/tmp/rhel-required-alert-{{ gui_uid }}.log 2>&1 </dev/null &
+        echo $! > /tmp/rhel-required-alert-{{ gui_uid }}.pid
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Verify that the alert stayed running
+      become_user: "{{ gui_user }}"
+      ansible.builtin.shell: |
+        sleep 2
+        pid=$(cat /tmp/rhel-required-alert-{{ gui_uid }}.pid 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+          exit 0
+        fi
+        echo "The graphical alert exited unexpectedly:"
+        cat /tmp/rhel-required-alert-{{ gui_uid }}.log 2>/dev/null || true
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Report delivery
+      ansible.builtin.debug:
+        msg: "Alert launched for {{ gui_user }} on {{ inventory_hostname }}"
